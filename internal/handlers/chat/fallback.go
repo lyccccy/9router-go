@@ -162,7 +162,7 @@ func (h *ChatHandler) handleAccountFallback(
 			continue
 		}
 		apiKey := extractAPIKey(connData)
-		if apiKey == "" {
+		if apiKey == "" && !customJSONKeyOptional(connData) {
 			providerCfg, pErr := h.getProviderConfig(provider, connData)
 			if pErr == nil && providerCfg.DefaultAPIKey != "" {
 				apiKey = providerCfg.DefaultAPIKey
@@ -202,6 +202,12 @@ func (h *ChatHandler) handleAccountFallback(
 				"provider", provider, "model", model, "conn", connObj.ID)
 			excludeIDs = append(excludeIDs, connObj.ID)
 			continue
+		}
+		// A custom JSON business endpoint may already have performed its
+		// operation when it failed, so the answer is final: no other account
+		// is tried and this one is not cooled down over a business error.
+		if isCustomJSONConn(connData) {
+			return lastErr
 		}
 
 		var ue *upstreamError
@@ -531,16 +537,17 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		}
 	}
 
+	customJSON := isCustomJSONConn(connData)
 	apiKey := resolveProviderAuthToken(provider, connData, extractAPIKey(connData))
 	if apiKey == "" {
 		if providerCfg.DefaultAPIKey != "" {
 			apiKey = providerCfg.DefaultAPIKey
-		} else {
+		} else if !customJSONKeyOptional(connData) {
 			return &upstreamError{StatusCode: http.StatusUnauthorized, Body: []byte(`{"error":{"message":"no API key found","type":"auth_error","code":401}}`)}
 		}
 	}
 
-	if connectionID != "" {
+	if connectionID != "" && !customJSON {
 		rekey, _, err := h.refreshOAuthTokenIfExpired(connectionID, apiKey)
 		if err == nil {
 			apiKey = rekey
@@ -922,7 +929,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		})
 	}
 
-	if exec := executor.Get(provider); exec != nil {
+	if exec := executorFor(provider, connData); exec != nil {
 		execReq := &executor.Request{
 			Ctx:            ctx,
 			Client:         httpClient,
@@ -965,7 +972,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	fwdErr = guardrailStreamOutcome(gtap, fwdErr)
 
 	var ue *upstreamError
-	if errors.As(fwdErr, &ue) && ue.StatusCode == http.StatusUnauthorized && connectionID != "" {
+	if errors.As(fwdErr, &ue) && ue.StatusCode == http.StatusUnauthorized && connectionID != "" && !customJSON {
 		refreshedKey, _, rErr := h.forceRefreshOAuthToken(connectionID)
 		if rErr == nil && refreshedKey != "" && refreshedKey != apiKey {
 			log.Info("fallback", "reactive 401 token refresh success, retrying request", "conn", connectionID)
